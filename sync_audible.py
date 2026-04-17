@@ -960,87 +960,132 @@ class SyncAudible:
         """Process books with 1 download thread + N conversion workers.
 
         Architecture:
-        - Main thread: DB reads/writes, ISBN lookups, result collection
+        - Main thread: DB reads/writes, ISBN lookups, result collection,
+          triages books (legacy/cached → workers, needs download → download thread)
         - Download thread: serial downloads from Audible (rate-limited)
         - Worker pool: parallel decrypt/embed/organize (CPU-bound)
         """
-        download_q = queue_mod.Queue(maxsize=self.workers * 2)
+        download_q = queue_mod.Queue()
+        result_q = queue_mod.Queue()
         SENTINEL = None
 
         def download_thread():
-            """Download books serially and feed them to the conversion pool."""
-            for book in books:
-                if self._shutdown:
+            """Download books serially from Audible, feed results back."""
+            while True:
+                item = download_q.get()
+                if item is SENTINEL:
                     break
+                if self._shutdown:
+                    continue
+                book = item
                 asin = book["asin"]
-                title = book["title"]
                 try:
                     paths = download_book(
                         self.auth, self.country_code, asin,
                         self.output_dir, self.activation_bytes,
-                        legacy_raw_dir=self.legacy_raw_dir,
-                        title=title,
                     )
                     self._last_download_time = time.time()
-                    download_q.put((book, paths, None))
+                    result_q.put(("downloaded", book, paths, None))
                 except Exception as e:
-                    download_q.put((book, None, e))
-            download_q.put(SENTINEL)
+                    result_q.put(("downloaded", book, None, e))
+            result_q.put(SENTINEL)
 
-        # Start download thread
         dl_thread = threading.Thread(target=download_thread, daemon=True)
         dl_thread.start()
 
-        # Process results from download thread using worker pool
+        needs_download = []
+
         with ThreadPoolExecutor(max_workers=self.workers) as pool:
             futures = {}
 
-            while True:
+            # Phase 1: Triage — books with local files go to workers immediately,
+            # books needing download get queued for the download thread
+            for book in books:
                 if self._shutdown:
                     break
+                asin = book["asin"]
+                title = book["short_title"] or book["title"]
 
-                try:
-                    item = download_q.get(timeout=1)
-                except queue_mod.Empty:
-                    # Check if any futures completed while waiting
-                    done = [f for f in futures if f.done()]
-                    for f in done:
-                        self._collect_result(f, futures.pop(f))
-                    continue
+                # Check if raw files already exist (per-ASIN dir or legacy)
+                paths = self._find_existing_raw(asin, book["title"])
+                if paths:
+                    upsert_book(self.conn, asin=asin, status="downloading",
+                                last_attempt=datetime.utcnow().isoformat())
+                    isbn = lookup_isbn(self.conn, title, book["author"])
+                    f = pool.submit(self._convert_book_worker, book, paths, isbn)
+                    futures[f] = book
+                else:
+                    download_q.put(book)
+                    needs_download.append(asin)
 
-                if item is SENTINEL:
+            log.info("Triaged: %d to workers, %d to download thread",
+                     len(books) - len(needs_download), len(needs_download))
+
+            # Signal download thread: no more books coming
+            download_q.put(SENTINEL)
+
+            # Phase 2: Collect results from download thread + worker pool
+            dl_done = False
+            while not dl_done or futures:
+                if self._shutdown:
+                    pool.shutdown(wait=False, cancel_futures=True)
                     break
 
-                book, paths, dl_error = item
-                asin = book["asin"]
+                # Check for download results (non-blocking)
+                try:
+                    item = result_q.get(timeout=0.5)
+                    if item is SENTINEL:
+                        dl_done = True
+                    else:
+                        _, book, paths, dl_error = item
+                        asin = book["asin"]
+                        if dl_error:
+                            log.error("  [%s] Download failed: %s", asin, dl_error)
+                            retry_count = book.get("retry_count", 0) + 1
+                            upsert_book(self.conn, asin=asin, status="failed",
+                                        error_message=str(dl_error), retry_count=retry_count)
+                        else:
+                            title = book["short_title"] or book["title"]
+                            upsert_book(self.conn, asin=asin, status="downloading",
+                                        last_attempt=datetime.utcnow().isoformat())
+                            isbn = lookup_isbn(self.conn, title, book["author"])
+                            f = pool.submit(self._convert_book_worker, book, paths, isbn)
+                            futures[f] = book
+                except queue_mod.Empty:
+                    pass
 
-                if dl_error:
-                    log.error("  [%s] Download failed: %s", asin, dl_error)
-                    retry_count = book.get("retry_count", 0) + 1
-                    upsert_book(self.conn, asin=asin, status="failed",
-                                error_message=str(dl_error), retry_count=retry_count)
-                    continue
-
-                # ISBN lookup on main thread
-                title = book["short_title"] or book["title"]
-                upsert_book(self.conn, asin=asin, status="downloading",
-                            last_attempt=datetime.utcnow().isoformat())
-                isbn = lookup_isbn(self.conn, title, book["author"])
-
-                # Submit conversion to worker pool
-                f = pool.submit(self._convert_book_worker, book, paths, isbn)
-                futures[f] = book
-
-                # Collect any completed futures (non-blocking)
+                # Collect completed worker futures
                 done = [f for f in futures if f.done()]
                 for f in done:
                     self._collect_result(f, futures.pop(f))
 
-            # Wait for remaining futures
-            for f in as_completed(futures):
-                self._collect_result(f, futures.pop(f))
-
         dl_thread.join(timeout=5)
+
+    def _find_existing_raw(self, asin: str, title: str) -> Optional[dict]:
+        """Check if raw files exist locally (no download needed). Returns paths or None."""
+        raw_dir = os.path.join(self.output_dir, ".raw", asin)
+
+        # Check per-ASIN directory
+        if os.path.isdir(raw_dir):
+            audio = _find_audio_file(raw_dir)
+            if audio:
+                return _build_paths(raw_dir, audio)
+
+        # Check legacy flat directory
+        if self.legacy_raw_dir and os.path.isdir(self.legacy_raw_dir):
+            legacy_paths = _find_legacy_raw_files(self.legacy_raw_dir, asin, title=title)
+            if legacy_paths:
+                os.makedirs(raw_dir, exist_ok=True)
+                for src in legacy_paths:
+                    dst = os.path.join(raw_dir, os.path.basename(src))
+                    if not os.path.exists(dst):
+                        os.symlink(src, dst)
+                audio = _find_audio_file(raw_dir)
+                if audio:
+                    log.info("  [%s] Found in legacy raw dir", asin)
+                    return _build_paths(raw_dir, audio)
+
+        return None
 
     def _collect_result(self, future, book: dict):
         """Collect result from a completed worker future (main thread)."""
