@@ -1,0 +1,33 @@
+# Audiobook data
+audiobooks/
+*.aax
+*.aaxc
+*.m4b
+*.m4a
+*.voucher
+
+# Auth files
+audible.json
+*.json.bak
+
+# State (tracked per-instance, not in repo)
+state.db
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# IDE
+.idea/
+.vscode/

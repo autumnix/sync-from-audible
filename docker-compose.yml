@@ -1,0 +1,17 @@
+services:
+  sync-audible:
+    build: .
+    container_name: sync-audible
+    restart: unless-stopped
+    environment:
+      - AUDIBLE_PASSWORD=${AUDIBLE_PASSWORD}
+      - ACTIVATION_BYTES=${ACTIVATION_BYTES}
+      - COUNTRY_CODE=us
+      - CONTINUOUS=true
+      - POLL_INTERVAL=3600
+      - MAX_RETRIES=3
+    volumes:
+      # Mount your audible auth config (contains audible.json)
+      - ./config:/config
+      # Mount your audiobooks output directory
+      - /mnt/user/media/audiobooks:/audiobooks
