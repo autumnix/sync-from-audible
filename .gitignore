@@ -6,9 +6,10 @@ audiobooks/
 *.m4a
 *.voucher
 
-# Auth files
+# Auth files and secrets
 audible.json
 *.json.bak
+.env
 
 # State (tracked per-instance, not in repo)
 state.db
