@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 # Install ffmpeg and gosu for UID/GID handling
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg gosu && \
+    apt-get install -y --no-install-recommends ffmpeg gosu curl && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -11,8 +11,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY sync_audible.py .
+COPY listenarr_import.sh .
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+RUN chmod +x /entrypoint.sh /app/listenarr_import.sh
 
 # Config and output volumes
 VOLUME ["/config", "/audiobooks"]
@@ -28,6 +29,11 @@ ENV PUID=99 \
     COUNTRY_CODE=us \
     CONTINUOUS=true \
     POLL_INTERVAL=3600 \
-    MAX_RETRIES=3
+    MAX_RETRIES=3 \
+    LISTENARR_URL="" \
+    LISTENARR_API_KEY="" \
+    LISTENARR_ROOT_ID=9 \
+    LISTENARR_IMPORT_MODE=move \
+    LISTENARR_DEST_ROOT_ID=1
 
 ENTRYPOINT ["/entrypoint.sh"]

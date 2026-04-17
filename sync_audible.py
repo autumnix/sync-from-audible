@@ -873,6 +873,32 @@ class SyncAudible:
             book = dict(row)
             self._process_book(book)
 
+        # After processing all books, trigger Listenarr import if configured
+        if self.ingest_dir and os.environ.get("LISTENARR_URL"):
+            self._trigger_listenarr_import()
+
+    def _trigger_listenarr_import(self):
+        """Trigger Listenarr to scan and import from the ingest directory."""
+        log.info("Triggering Listenarr import...")
+        try:
+            result = subprocess.run(
+                ["/app/listenarr_import.sh"],
+                capture_output=True, text=True, timeout=300,
+                env={**os.environ},
+            )
+            if result.returncode == 0:
+                log.info("Listenarr import complete")
+                if result.stdout.strip():
+                    for line in result.stdout.strip().split("\n"):
+                        log.info("  %s", line)
+            else:
+                log.warning("Listenarr import failed (rc=%d): %s",
+                            result.returncode, result.stderr.strip())
+        except FileNotFoundError:
+            log.debug("listenarr_import.sh not found, skipping")
+        except Exception as e:
+            log.warning("Listenarr import error: %s", e)
+
     def _process_book(self, book: dict):
         """Process a single book through the full pipeline."""
         asin = book["asin"]
