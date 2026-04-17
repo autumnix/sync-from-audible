@@ -426,31 +426,20 @@ def _find_legacy_raw_files(legacy_dir: str, asin: str, title: str = "") -> list[
     # Strategy 2: Match audio filenames by title
     # Use strict matching: exact match or title matches the start of the filename
     # up to a word boundary (to avoid "The Housemaid" matching "The Housemaids Wedding")
+    # For multi-part books, collect ALL matching files (not just the first match's prefix)
     if title:
         norm_title = _normalize_for_filename(title)
-        best_match = None
-        best_score = 0
+        matched_files = []
         for f in Path(legacy_dir).iterdir():
-            if f.suffix not in (".aax", ".aaxc"):
-                continue
             norm_fname = _normalize_for_filename(_legacy_filename_prefix(f.stem))
             if not norm_title or not norm_fname:
                 continue
 
-            if norm_title == norm_fname:
-                # Exact match — use immediately
-                prefix = _legacy_filename_prefix(f.stem)
-                return _collect_legacy_files(legacy_dir, prefix)
+            if norm_title == norm_fname or norm_fname.startswith(norm_title + " "):
+                matched_files.append(str(f))
 
-            # Check if the filename starts with the full title
-            # e.g. "a deadly education" matches "a deadly education a novel the scholomance book 1"
-            if norm_fname.startswith(norm_title + " ") and len(norm_title) > best_score:
-                best_match = f
-                best_score = len(norm_title)
-
-        if best_match:
-            prefix = _legacy_filename_prefix(best_match.stem)
-            return _collect_legacy_files(legacy_dir, prefix)
+        if matched_files:
+            return matched_files
 
     return matches
 
