@@ -12,8 +12,11 @@ services:
       - CONTINUOUS=true
       - POLL_INTERVAL=3600
       - MAX_RETRIES=3
+      - INGEST_DIR=/media/ingest
     volumes:
       # Audible auth + state database
       - /mnt/user/appdata/sync-audible:/config
-      # Write directly to the Listenarr ingest directory
-      - /mnt/user/media/torrents/ingest/audiobooks:/audiobooks
+      # Persistent library — on same share as ingest so hardlinks work
+      - /mnt/user/media/sync-audible/audiobooks:/audiobooks
+      # Listenarr ingest directory (hardlinks land here)
+      - /mnt/user/media/torrents/ingest/audiobooks:/media/ingest

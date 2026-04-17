@@ -726,6 +726,36 @@ def organize_book(
     return book_dir
 
 
+def hardlink_to_ingest(book_dir: str, ingest_dir: str, output_base: str):
+    """Hardlink a completed book directory into the ingest directory.
+
+    Preserves the Author/Series/Book structure. Uses hardlinks so the
+    original stays in place for the script's state tracking while Listenarr
+    can move/rename the ingest copy freely.
+    """
+    # Compute the relative path from output_base to book_dir
+    rel_path = os.path.relpath(book_dir, output_base)
+    dest_dir = os.path.join(ingest_dir, rel_path)
+
+    if os.path.exists(dest_dir):
+        log.debug("  Ingest dir already exists: %s", dest_dir)
+        return
+
+    os.makedirs(dest_dir, exist_ok=True)
+
+    for fname in os.listdir(book_dir):
+        src = os.path.join(book_dir, fname)
+        dst = os.path.join(dest_dir, fname)
+        if os.path.isfile(src) and not os.path.exists(dst):
+            try:
+                os.link(src, dst)
+            except OSError:
+                # Cross-device link — fall back to copy
+                shutil.copy2(src, dst)
+
+    log.info("  Hardlinked to ingest: %s", dest_dir)
+
+
 # ---------------------------------------------------------------------------
 # Main processing pipeline
 # ---------------------------------------------------------------------------
@@ -744,6 +774,7 @@ class SyncAudible:
         self.dry_run = args.dry_run
         self.max_retries = args.max_retries
         self.legacy_raw_dir = getattr(args, "legacy_raw_dir", None)
+        self.ingest_dir = getattr(args, "ingest_dir", None) or os.environ.get("INGEST_DIR", "")
 
         self.conn = init_db(self.state_db_path)
         self.auth = None
@@ -913,6 +944,10 @@ class SyncAudible:
                 short_title=title,
             )
 
+            # Step 8: Hardlink to ingest directory if configured
+            if self.ingest_dir:
+                hardlink_to_ingest(final_dir, self.ingest_dir, self.output_dir)
+
             # Update ISBN in DB
             upsert_book(self.conn, asin=asin, isbn=isbn)
 
@@ -1026,6 +1061,11 @@ def main():
         type=int,
         default=int(os.environ.get("MAX_RETRIES", "3")),
         help="Max retries per book before giving up",
+    )
+    parser.add_argument(
+        "--ingest-dir",
+        default=os.environ.get("INGEST_DIR", ""),
+        help="Directory to hardlink completed books into (e.g. Listenarr ingest path)",
     )
     parser.add_argument(
         "--legacy-raw-dir",
