@@ -315,6 +315,7 @@ def download_book(
     output_dir: str,
     activation_bytes: str,
     legacy_raw_dir: Optional[str] = None,
+    title: str = "",
 ) -> dict:
     """Download a single book (AAX with AAXC fallback). Returns paths dict."""
     raw_dir = os.path.join(output_dir, ".raw", asin)
@@ -328,7 +329,7 @@ def download_book(
 
     # Check legacy flat raw directory (from previous scripts)
     if legacy_raw_dir and os.path.isdir(legacy_raw_dir):
-        legacy_paths = _find_legacy_raw_files(legacy_raw_dir, asin)
+        legacy_paths = _find_legacy_raw_files(legacy_raw_dir, asin, title=title)
         if legacy_paths:
             log.info("  Found in legacy raw dir, linking...")
             for src in legacy_paths:
@@ -388,14 +389,21 @@ def _build_paths(raw_dir: str, audio_file: str) -> dict:
     }
 
 
-def _find_legacy_raw_files(legacy_dir: str, asin: str) -> list[str]:
-    """Search a flat raw directory for files belonging to an ASIN.
+def _find_legacy_raw_files(legacy_dir: str, asin: str, title: str = "") -> list[str]:
+    """Search a flat raw directory for files belonging to a book.
 
-    The legacy layout uses title-based filenames. We match by checking
-    voucher files for ASIN, or fall back to the library metadata.
+    The legacy layout uses title-based filenames like:
+      Title_Words-LC_128_44100_stereo.aax
+      Title_Words-chapters.json
+      Title_Words_(500).jpg
+
+    Matching strategy:
+    1. Check voucher files for ASIN (AAXC files)
+    2. Match audio filenames against the book title
     """
     matches = []
-    # Check all voucher files for this ASIN
+
+    # Strategy 1: Check voucher files for ASIN
     for f in Path(legacy_dir).glob("*.voucher"):
         try:
             with open(f) as vf:
@@ -403,18 +411,60 @@ def _find_legacy_raw_files(legacy_dir: str, asin: str) -> list[str]:
             v_asin = (v.get("asin", "") or
                       v.get("content_license", {}).get("asin", ""))
             if v_asin == asin:
-                base = f.stem  # e.g. "Title-AAX_44_128"
-                for related in Path(legacy_dir).glob(f"{base}*"):
-                    matches.append(str(related))
-                # Also find chapter/cover files with similar prefix
-                prefix = base.split("-")[0] if "-" in base else base
-                for related in Path(legacy_dir).iterdir():
-                    rname = related.name
-                    if rname.startswith(prefix) and str(related) not in matches:
-                        matches.append(str(related))
-                break
+                prefix = _legacy_filename_prefix(f.stem)
+                matches = _collect_legacy_files(legacy_dir, prefix)
+                if matches:
+                    return matches
         except Exception:
             continue
+
+    # Strategy 2: Match audio filenames by title
+    if title:
+        norm_title = _normalize_for_filename(title)
+        for f in Path(legacy_dir).iterdir():
+            if not f.suffix in (".aax", ".aaxc"):
+                continue
+            norm_fname = _normalize_for_filename(_legacy_filename_prefix(f.stem))
+            if norm_title and norm_fname and (
+                norm_title == norm_fname or
+                norm_title in norm_fname or
+                norm_fname in norm_title
+            ):
+                prefix = _legacy_filename_prefix(f.stem)
+                matches = _collect_legacy_files(legacy_dir, prefix)
+                if matches:
+                    return matches
+
+    return matches
+
+
+def _legacy_filename_prefix(stem: str) -> str:
+    """Extract the title prefix from a legacy filename stem.
+
+    E.g. 'Title_Words-LC_128_44100_stereo' -> 'Title_Words'
+         'Title_Words-AAX_44_128' -> 'Title_Words'
+    """
+    # Split on known codec/format suffixes
+    for sep in ["-LC_", "-AAX_", "-mp4_"]:
+        if sep in stem:
+            return stem.split(sep)[0]
+    return stem
+
+
+def _normalize_for_filename(s: str) -> str:
+    """Normalize a string for fuzzy filename matching."""
+    s = s.lower()
+    s = re.sub(r"[_\-\s'\".,!?:;()\[\]{}]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _collect_legacy_files(legacy_dir: str, prefix: str) -> list[str]:
+    """Collect all files in legacy_dir that start with the given prefix."""
+    matches = []
+    for f in Path(legacy_dir).iterdir():
+        if f.name.startswith(prefix):
+            matches.append(str(f))
     return matches
 
 
@@ -918,6 +968,7 @@ class SyncAudible:
                 self.auth, self.country_code, asin,
                 self.output_dir, self.activation_bytes,
                 legacy_raw_dir=self.legacy_raw_dir,
+                title=book["title"],
             )
             self._last_download_time = time.time()
             self._current_backoff = INITIAL_BACKOFF
