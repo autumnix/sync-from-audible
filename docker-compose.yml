@@ -4,6 +4,8 @@ services:
     container_name: sync-audible
     restart: unless-stopped
     environment:
+      - PUID=99
+      - PGID=100
       - AUDIBLE_PASSWORD=${AUDIBLE_PASSWORD}
       - ACTIVATION_BYTES=${ACTIVATION_BYTES}
       - COUNTRY_CODE=us
@@ -11,7 +13,7 @@ services:
       - POLL_INTERVAL=3600
       - MAX_RETRIES=3
     volumes:
-      # Mount your audible auth config (contains audible.json)
-      - ./config:/config
-      # Mount your audiobooks output directory
-      - /mnt/user/media/audiobooks:/audiobooks
+      # Audible auth + state database
+      - /mnt/user/appdata/sync-audible:/config
+      # Write directly to the Listenarr ingest directory
+      - /mnt/user/media/torrents/ingest/audiobooks:/audiobooks
