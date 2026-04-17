@@ -32,6 +32,7 @@ import threading
 import time
 import urllib.request
 import urllib.error
+import queue as queue_mod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -927,37 +928,7 @@ class SyncAudible:
                     break
                 self._process_book(book)
         else:
-            with ThreadPoolExecutor(max_workers=self.workers) as pool:
-                futures = {}
-                for book in books:
-                    if self._shutdown:
-                        break
-                    asin = book["asin"]
-                    upsert_book(self.conn, asin=asin, status="downloading",
-                                last_attempt=datetime.utcnow().isoformat())
-                    # Look up ISBN on main thread (uses shared DB)
-                    title = book["short_title"] or book["title"]
-                    isbn = lookup_isbn(self.conn, title, book["author"])
-                    f = pool.submit(self._process_book_worker, book, isbn)
-                    futures[f] = book
-
-                for f in as_completed(futures):
-                    book = futures[f]
-                    asin = book["asin"]
-                    if self._shutdown:
-                        pool.shutdown(wait=False, cancel_futures=True)
-                        break
-                    try:
-                        result = f.result()
-                        upsert_book(self.conn, asin=asin, isbn=result.get("isbn"),
-                                    status="completed", output_path=result["output_path"],
-                                    completed_at=datetime.utcnow().isoformat())
-                        log.info("  [%s] Done: %s", asin, result["output_path"])
-                    except Exception as e:
-                        log.error("  [%s] Failed: %s", asin, e)
-                        retry_count = book.get("retry_count", 0) + 1
-                        upsert_book(self.conn, asin=asin, status="failed",
-                                    error_message=str(e), retry_count=retry_count)
+            self._process_books_parallel(books)
 
         # After processing all books, trigger Listenarr import if configured
         if self.ingest_dir and os.environ.get("LISTENARR_URL"):
@@ -984,6 +955,148 @@ class SyncAudible:
             log.debug("listenarr_import.sh not found, skipping")
         except Exception as e:
             log.warning("Listenarr import error: %s", e)
+
+    def _process_books_parallel(self, books: list[dict]):
+        """Process books with 1 download thread + N conversion workers.
+
+        Architecture:
+        - Main thread: DB reads/writes, ISBN lookups, result collection
+        - Download thread: serial downloads from Audible (rate-limited)
+        - Worker pool: parallel decrypt/embed/organize (CPU-bound)
+        """
+        download_q = queue_mod.Queue(maxsize=self.workers * 2)
+        SENTINEL = None
+
+        def download_thread():
+            """Download books serially and feed them to the conversion pool."""
+            for book in books:
+                if self._shutdown:
+                    break
+                asin = book["asin"]
+                title = book["title"]
+                try:
+                    paths = download_book(
+                        self.auth, self.country_code, asin,
+                        self.output_dir, self.activation_bytes,
+                        legacy_raw_dir=self.legacy_raw_dir,
+                        title=title,
+                    )
+                    self._last_download_time = time.time()
+                    download_q.put((book, paths, None))
+                except Exception as e:
+                    download_q.put((book, None, e))
+            download_q.put(SENTINEL)
+
+        # Start download thread
+        dl_thread = threading.Thread(target=download_thread, daemon=True)
+        dl_thread.start()
+
+        # Process results from download thread using worker pool
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            futures = {}
+
+            while True:
+                if self._shutdown:
+                    break
+
+                try:
+                    item = download_q.get(timeout=1)
+                except queue_mod.Empty:
+                    # Check if any futures completed while waiting
+                    done = [f for f in futures if f.done()]
+                    for f in done:
+                        self._collect_result(f, futures.pop(f))
+                    continue
+
+                if item is SENTINEL:
+                    break
+
+                book, paths, dl_error = item
+                asin = book["asin"]
+
+                if dl_error:
+                    log.error("  [%s] Download failed: %s", asin, dl_error)
+                    retry_count = book.get("retry_count", 0) + 1
+                    upsert_book(self.conn, asin=asin, status="failed",
+                                error_message=str(dl_error), retry_count=retry_count)
+                    continue
+
+                # ISBN lookup on main thread
+                title = book["short_title"] or book["title"]
+                upsert_book(self.conn, asin=asin, status="downloading",
+                            last_attempt=datetime.utcnow().isoformat())
+                isbn = lookup_isbn(self.conn, title, book["author"])
+
+                # Submit conversion to worker pool
+                f = pool.submit(self._convert_book_worker, book, paths, isbn)
+                futures[f] = book
+
+                # Collect any completed futures (non-blocking)
+                done = [f for f in futures if f.done()]
+                for f in done:
+                    self._collect_result(f, futures.pop(f))
+
+            # Wait for remaining futures
+            for f in as_completed(futures):
+                self._collect_result(f, futures.pop(f))
+
+        dl_thread.join(timeout=5)
+
+    def _collect_result(self, future, book: dict):
+        """Collect result from a completed worker future (main thread)."""
+        asin = book["asin"]
+        try:
+            result = future.result()
+            upsert_book(self.conn, asin=asin, isbn=result.get("isbn"),
+                        status="completed", output_path=result["output_path"],
+                        completed_at=datetime.utcnow().isoformat())
+            log.info("  [%s] Done: %s", asin, result["output_path"])
+        except Exception as e:
+            log.error("  [%s] Failed: %s", asin, e)
+            retry_count = book.get("retry_count", 0) + 1
+            upsert_book(self.conn, asin=asin, status="failed",
+                        error_message=str(e), retry_count=retry_count)
+
+    def _convert_book_worker(self, book: dict, paths: dict, isbn: Optional[str] = None) -> dict:
+        """Convert a downloaded book (no DB access). Called from worker pool."""
+        asin = book["asin"]
+        title = book["short_title"] or book["title"]
+        log.info("  [%s] Converting: %s — %s", asin, book["author"], title)
+
+        # Decrypt
+        staging_dir = os.path.join(self.output_dir, ".staging", asin)
+        os.makedirs(staging_dir, exist_ok=True)
+        safe_title = sanitize_filename(title)
+        m4b_path = os.path.join(staging_dir, f"{safe_title}.m4b")
+
+        decrypt_to_m4b(
+            paths["audio"], m4b_path,
+            self.activation_bytes, paths.get("voucher"),
+            paths.get("chapters"),
+        )
+
+        embed_chapters_from_json(m4b_path, paths.get("chapters"))
+
+        embed_metadata(
+            m4b_path, title=title, author=book["author"],
+            series_name=book["series_name"], series_seq=book["series_sequence"],
+            asin=asin, isbn=isbn, cover_path=paths.get("cover"),
+        )
+
+        meta_check = verify_metadata(m4b_path)
+        log.info("  [%s] Verified: chapters=%d", asin, meta_check["chapter_count"])
+
+        final_dir = organize_book(
+            m4b_path, paths.get("cover"), self.output_dir,
+            author=book["author"], series_name=book["series_name"],
+            short_title=title,
+        )
+
+        if self.ingest_dir:
+            hardlink_to_ingest(final_dir, self.ingest_dir, self.output_dir)
+
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        return {"output_path": final_dir, "isbn": isbn}
 
     def _process_book_worker(self, book: dict, isbn: Optional[str] = None) -> dict:
         """Process a single book (no DB access). Returns result dict or raises."""
