@@ -384,8 +384,10 @@ def download_book(
 
 
 def _build_paths(raw_dir: str, audio_file: str) -> dict:
+    all_audio = _find_all_audio_files(raw_dir)
     return {
         "audio": audio_file,
+        "audio_files": all_audio if len(all_audio) > 1 else [audio_file],
         "chapters": _find_file(raw_dir, "-chapters.json"),
         "cover": _find_file(raw_dir, ".jpg"),
         "voucher": _find_file(raw_dir, ".voucher"),
@@ -501,10 +503,19 @@ def _find_audible_cli() -> Optional[str]:
 
 
 def _find_audio_file(directory: str) -> Optional[str]:
+    """Find the first audio file in a directory."""
     for ext in (".aax", ".aaxc"):
-        for f in Path(directory).glob(f"*{ext}"):
+        for f in sorted(Path(directory).glob(f"*{ext}")):
             return str(f)
     return None
+
+
+def _find_all_audio_files(directory: str) -> list[str]:
+    """Find all audio files in a directory, sorted for correct part order."""
+    files = []
+    for ext in (".aax", ".aaxc"):
+        files.extend(str(f) for f in Path(directory).glob(f"*{ext}"))
+    return sorted(files)
 
 
 def _find_file(directory: str, suffix: str) -> Optional[str]:
@@ -525,9 +536,18 @@ def decrypt_to_m4b(
     activation_bytes: str,
     voucher_path: Optional[str],
     chapters_json: Optional[str],
+    audio_files: Optional[list[str]] = None,
 ) -> str:
-    """Decrypt AAX/AAXC to M4B preserving chapters."""
+    """Decrypt AAX/AAXC to M4B preserving chapters.
+
+    If audio_files contains multiple parts, each is decrypted separately
+    then concatenated into a single M4B with chapters preserved.
+    """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    parts = audio_files or [audio_path]
+    if len(parts) > 1:
+        return _decrypt_multipart(parts, output_path, activation_bytes, voucher_path, chapters_json)
 
     tmp_output = output_path + ".converting.m4b"
 
@@ -571,6 +591,90 @@ def decrypt_to_m4b(
         raise RuntimeError(f"Decryption failed: {result.stderr.strip()}")
 
     os.rename(tmp_output, output_path)
+    return output_path
+
+
+def _decrypt_multipart(
+    audio_files: list[str],
+    output_path: str,
+    activation_bytes: str,
+    voucher_path: Optional[str],
+    chapters_json: Optional[str],
+) -> str:
+    """Decrypt multiple AAX parts and concatenate into a single M4B.
+
+    Uses ffmpeg's concat demuxer which preserves chapters from each part,
+    offsetting them by the cumulative duration of previous parts.
+    """
+    staging = os.path.dirname(output_path)
+    decrypted_parts = []
+
+    log.info("  Decrypting %d parts to M4B...", len(audio_files))
+
+    # Step 1: Decrypt each part individually
+    for i, audio_path in enumerate(sorted(audio_files)):
+        part_path = os.path.join(staging, f".part_{i:02d}.m4b")
+
+        if audio_path.endswith(".aaxc") and voucher_path:
+            with open(voucher_path) as f:
+                voucher = json.load(f)
+            lr = voucher.get("content_license", {}).get("license_response", {})
+            cmd = [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-audible_key", lr.get("key", ""),
+                "-audible_iv", lr.get("iv", ""),
+                "-i", audio_path, "-c", "copy", part_path,
+            ]
+        else:
+            cmd = [
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-activation_bytes", activation_bytes,
+                "-i", audio_path, "-c", "copy", part_path,
+            ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0:
+            raise RuntimeError(f"Decryption failed for part {i}: {result.stderr.strip()}")
+        decrypted_parts.append(part_path)
+        log.info("  Part %d/%d decrypted", i + 1, len(audio_files))
+
+    # Step 2: Concatenate using ffmpeg concat demuxer (preserves chapters)
+    concat_list = os.path.join(staging, ".concat_list.txt")
+    with open(concat_list, "w") as f:
+        for part in decrypted_parts:
+            # Escape single quotes in path for ffmpeg concat format
+            escaped = part.replace("'", "'\\''")
+            f.write(f"file '{escaped}'\n")
+
+    tmp_output = output_path + ".converting.m4b"
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-f", "concat", "-safe", "0",
+        "-i", concat_list,
+        "-c", "copy",
+        tmp_output,
+    ]
+
+    log.info("  Concatenating %d parts...", len(decrypted_parts))
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
+    if result.returncode != 0:
+        raise RuntimeError(f"Concatenation failed: {result.stderr.strip()}")
+
+    os.rename(tmp_output, output_path)
+
+    # Clean up part files and concat list
+    for part in decrypted_parts:
+        os.remove(part)
+    os.remove(concat_list)
+
+    # Verify chapter count
+    probe = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_chapters", output_path],
+        capture_output=True, text=True,
+    )
+    chapters = json.loads(probe.stdout).get("chapters", [])
+    log.info("  Concatenated: %d chapters across %d parts", len(chapters), len(audio_files))
+
     return output_path
 
 
@@ -1132,6 +1236,7 @@ class SyncAudible:
             paths["audio"], m4b_path,
             self.activation_bytes, paths.get("voucher"),
             paths.get("chapters"),
+            audio_files=paths.get("audio_files"),
         )
 
         embed_chapters_from_json(m4b_path, paths.get("chapters"))
@@ -1182,6 +1287,7 @@ class SyncAudible:
             paths["audio"], m4b_path,
             self.activation_bytes, paths.get("voucher"),
             paths.get("chapters"),
+            audio_files=paths.get("audio_files"),
         )
 
         # Step 3: Embed chapters if needed
