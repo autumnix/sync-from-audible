@@ -28,9 +28,11 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -825,6 +827,7 @@ class SyncAudible:
         self.max_retries = args.max_retries
         self.legacy_raw_dir = getattr(args, "legacy_raw_dir", None)
         self.ingest_dir = getattr(args, "ingest_dir", None) or os.environ.get("INGEST_DIR", "")
+        self.workers = int(getattr(args, "workers", None) or os.environ.get("WORKERS", "1"))
 
         self.conn = init_db(self.state_db_path)
         self.auth = None
@@ -913,15 +916,48 @@ class SyncAudible:
             (self.max_retries,),
         ).fetchall()
 
-        log.info("Processing %d books...", len(pending))
+        log.info("Processing %d books with %d workers...", len(pending), self.workers)
         self._last_download_time = time.time()
 
-        for row in pending:
-            if self._shutdown:
-                break
+        books = [dict(row) for row in pending]
 
-            book = dict(row)
-            self._process_book(book)
+        if self.workers <= 1:
+            for book in books:
+                if self._shutdown:
+                    break
+                self._process_book(book)
+        else:
+            with ThreadPoolExecutor(max_workers=self.workers) as pool:
+                futures = {}
+                for book in books:
+                    if self._shutdown:
+                        break
+                    asin = book["asin"]
+                    upsert_book(self.conn, asin=asin, status="downloading",
+                                last_attempt=datetime.utcnow().isoformat())
+                    # Look up ISBN on main thread (uses shared DB)
+                    title = book["short_title"] or book["title"]
+                    isbn = lookup_isbn(self.conn, title, book["author"])
+                    f = pool.submit(self._process_book_worker, book, isbn)
+                    futures[f] = book
+
+                for f in as_completed(futures):
+                    book = futures[f]
+                    asin = book["asin"]
+                    if self._shutdown:
+                        pool.shutdown(wait=False, cancel_futures=True)
+                        break
+                    try:
+                        result = f.result()
+                        upsert_book(self.conn, asin=asin, isbn=result.get("isbn"),
+                                    status="completed", output_path=result["output_path"],
+                                    completed_at=datetime.utcnow().isoformat())
+                        log.info("  [%s] Done: %s", asin, result["output_path"])
+                    except Exception as e:
+                        log.error("  [%s] Failed: %s", asin, e)
+                        retry_count = book.get("retry_count", 0) + 1
+                        upsert_book(self.conn, asin=asin, status="failed",
+                                    error_message=str(e), retry_count=retry_count)
 
         # After processing all books, trigger Listenarr import if configured
         if self.ingest_dir and os.environ.get("LISTENARR_URL"):
@@ -949,11 +985,79 @@ class SyncAudible:
         except Exception as e:
             log.warning("Listenarr import error: %s", e)
 
-    def _process_book(self, book: dict):
-        """Process a single book through the full pipeline."""
+    def _process_book_worker(self, book: dict, isbn: Optional[str] = None) -> dict:
+        """Process a single book (no DB access). Returns result dict or raises."""
         asin = book["asin"]
         title = book["short_title"] or book["title"]
         log.info("Processing: %s — %s [%s]", book["author"], title, asin)
+
+        # Step 1: Download
+        paths = download_book(
+            self.auth, self.country_code, asin,
+            self.output_dir, self.activation_bytes,
+            legacy_raw_dir=self.legacy_raw_dir,
+            title=book["title"],
+        )
+        self._last_download_time = time.time()
+
+        # Step 2: Decrypt
+        staging_dir = os.path.join(self.output_dir, ".staging", asin)
+        os.makedirs(staging_dir, exist_ok=True)
+        safe_title = sanitize_filename(title)
+        m4b_path = os.path.join(staging_dir, f"{safe_title}.m4b")
+
+        decrypt_to_m4b(
+            paths["audio"], m4b_path,
+            self.activation_bytes, paths.get("voucher"),
+            paths.get("chapters"),
+        )
+
+        # Step 3: Embed chapters if needed
+        embed_chapters_from_json(m4b_path, paths.get("chapters"))
+
+        if isbn:
+            log.info("  [%s] ISBN: %s", asin, isbn)
+
+        # Step 4: Embed metadata
+        embed_metadata(
+            m4b_path,
+            title=title,
+            author=book["author"],
+            series_name=book["series_name"],
+            series_seq=book["series_sequence"],
+            asin=asin,
+            isbn=isbn,
+            cover_path=paths.get("cover"),
+        )
+
+        # Step 5: Verify metadata
+        meta_check = verify_metadata(m4b_path)
+        tags = meta_check["tags"]
+        log.info("  [%s] Verified: title=%s, chapters=%d",
+                 asin, tags.get("title", "?"), meta_check["chapter_count"])
+
+        # Step 6: Organize into final folder structure
+        final_dir = organize_book(
+            m4b_path, paths.get("cover"),
+            self.output_dir,
+            author=book["author"],
+            series_name=book["series_name"],
+            short_title=title,
+        )
+
+        # Step 7: Hardlink to ingest directory if configured
+        if self.ingest_dir:
+            hardlink_to_ingest(final_dir, self.ingest_dir, self.output_dir)
+
+        # Clean up staging
+        shutil.rmtree(staging_dir, ignore_errors=True)
+
+        return {"output_path": final_dir, "isbn": isbn}
+
+    def _process_book(self, book: dict):
+        """Process a single book (serial mode — handles DB updates)."""
+        asin = book["asin"]
+        title = book["short_title"] or book["title"]
 
         if self.dry_run:
             log.info("  [DRY RUN] Would process %s", asin)
@@ -963,88 +1067,19 @@ class SyncAudible:
             upsert_book(self.conn, asin=asin, status="downloading",
                         last_attempt=datetime.utcnow().isoformat())
 
-            # Step 1: Download
-            paths = download_book(
-                self.auth, self.country_code, asin,
-                self.output_dir, self.activation_bytes,
-                legacy_raw_dir=self.legacy_raw_dir,
-                title=book["title"],
-            )
-            self._last_download_time = time.time()
-            self._current_backoff = INITIAL_BACKOFF
-
-            # Step 2: Decrypt
-            staging_dir = os.path.join(self.output_dir, ".staging", asin)
-            os.makedirs(staging_dir, exist_ok=True)
-            safe_title = sanitize_filename(title)
-            m4b_path = os.path.join(staging_dir, f"{safe_title}.m4b")
-
-            decrypt_to_m4b(
-                paths["audio"], m4b_path,
-                self.activation_bytes, paths.get("voucher"),
-                paths.get("chapters"),
-            )
-
-            # Step 3: Embed chapters if needed
-            embed_chapters_from_json(m4b_path, paths.get("chapters"))
-
-            # Step 4: Look up ISBN
             isbn = lookup_isbn(self.conn, title, book["author"])
-            if isbn:
-                log.info("  Found ISBN: %s", isbn)
+            result = self._process_book_worker(book, isbn)
 
-            # Step 5: Embed metadata
-            embed_metadata(
-                m4b_path,
-                title=title,
-                author=book["author"],
-                series_name=book["series_name"],
-                series_seq=book["series_sequence"],
-                asin=asin,
-                isbn=isbn,
-                cover_path=paths.get("cover"),
-            )
-
-            # Step 6: Verify metadata
-            meta_check = verify_metadata(m4b_path)
-            tags = meta_check["tags"]
-            log.info("  Verified: title=%s, chapters=%d, ASIN=%s, ISBN=%s",
-                     tags.get("title", "?"), meta_check["chapter_count"],
-                     tags.get("ASIN", "?"), tags.get("ISBN", "none"))
-
-            # Step 7: Organize into final folder structure
-            final_dir = organize_book(
-                m4b_path, paths.get("cover"),
-                self.output_dir,
-                author=book["author"],
-                series_name=book["series_name"],
-                short_title=title,
-            )
-
-            # Step 8: Hardlink to ingest directory if configured
-            if self.ingest_dir:
-                hardlink_to_ingest(final_dir, self.ingest_dir, self.output_dir)
-
-            # Update ISBN in DB
-            upsert_book(self.conn, asin=asin, isbn=isbn)
-
-            # Clean up staging
-            shutil.rmtree(staging_dir, ignore_errors=True)
-
-            upsert_book(
-                self.conn, asin=asin, status="completed",
-                output_path=final_dir,
-                completed_at=datetime.utcnow().isoformat(),
-            )
-            log.info("  Done: %s", final_dir)
+            upsert_book(self.conn, asin=asin, isbn=result.get("isbn"),
+                        status="completed", output_path=result["output_path"],
+                        completed_at=datetime.utcnow().isoformat())
+            log.info("  [%s] Done: %s", asin, result["output_path"])
 
         except Exception as e:
-            log.error("  Failed: %s", e)
+            log.error("  [%s] Failed: %s", asin, e)
             retry_count = book.get("retry_count", 0) + 1
-            upsert_book(
-                self.conn, asin=asin, status="failed",
-                error_message=str(e), retry_count=retry_count,
-            )
+            upsert_book(self.conn, asin=asin, status="failed",
+                        error_message=str(e), retry_count=retry_count)
             self._backoff()
 
     def _backoff(self):
@@ -1138,6 +1173,12 @@ def main():
         type=int,
         default=int(os.environ.get("MAX_RETRIES", "3")),
         help="Max retries per book before giving up",
+    )
+    parser.add_argument(
+        "--workers", "-w",
+        type=int,
+        default=int(os.environ.get("WORKERS", "1")),
+        help="Number of parallel workers for processing books (default: 1)",
     )
     parser.add_argument(
         "--ingest-dir",
