@@ -194,16 +194,7 @@ def parse_library_item(item: dict) -> dict:
     title = item.get("title", "Unknown Title")
     subtitle = item.get("subtitle")
 
-    # The "short" title is just the title field — Audible already keeps it short.
-    # The long form is typically "title: subtitle" or "Series Name: Title".
-    short_title = title
-
-    # If the title contains series prefix like "Star Wars: A New Dawn", extract the book part
-    if series_name and ":" in title:
-        parts = title.split(":", 1)
-        # Check if the first part matches the series name
-        if _normalize(parts[0].strip()) == _normalize(series_name):
-            short_title = parts[1].strip()
+    short_title = _extract_short_title(title, series_name)
 
     return {
         "asin": item["asin"],
@@ -215,6 +206,43 @@ def parse_library_item(item: dict) -> dict:
         "series_sequence": series_seq,
         "content_delivery_type": item.get("content_delivery_type"),
     }
+
+
+def _extract_short_title(title: str, series_name: Optional[str]) -> str:
+    """Extract a short, Listenarr-friendly book title.
+
+    Strategy:
+    - If the title starts with the series name followed by ':', strip the series prefix
+      and use the remainder as the short title — BUT only if the remainder is a
+      meaningful book title (not just "Special Edition" or "The Complete Series").
+    - Otherwise keep the original title as-is.
+    """
+    if not series_name or ":" not in title:
+        return title
+
+    # Check if title starts with series name + ":"
+    parts = title.split(":", 1)
+    prefix = parts[0].strip()
+
+    if _normalize(prefix) == _normalize(series_name):
+        remainder = parts[1].strip()
+        # Reject remainders that are just qualifiers, not real book titles
+        reject_patterns = [
+            r"^(special|deluxe|collector'?s?)\s+edition$",
+            r"^the\s+complete\s+(series|collection|saga)$",
+            r"^complete\s+(series|collection|saga)$",
+            r"^books?\s+\d",
+            r"^(the\s+)?definitive\s+(collection|edition)",
+            r"^omnibus",
+        ]
+        for pat in reject_patterns:
+            if re.match(pat, remainder, re.IGNORECASE):
+                return title
+        # Accept the remainder as the short title
+        if len(remainder) > 2:
+            return remainder
+
+    return title
 
 
 def _normalize(s: str) -> str:
