@@ -613,14 +613,14 @@ def _decrypt_multipart(
                 "-audible_key", lr.get("key", ""),
                 "-audible_iv", lr.get("iv", ""),
                 "-i", audio_path,
-                "-map", "0:a", "-c", "copy", part_path,
+                "-map", "0:a", "-map_chapters", "0", "-c", "copy", part_path,
             ]
         else:
             cmd = [
                 "ffmpeg", "-y", "-loglevel", "error",
                 "-activation_bytes", activation_bytes,
                 "-i", audio_path,
-                "-map", "0:a", "-c", "copy", part_path,
+                "-map", "0:a", "-map_chapters", "0", "-c", "copy", part_path,
             ]
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
@@ -732,7 +732,7 @@ def embed_chapters_from_json(m4b_path: str, chapters_json_path: str):
             mf.write(f"END={start_ms + length_ms}\n")
             mf.write(f"title={title}\n")
 
-    tmp = m4b_path + ".chapters.tmp"
+    tmp = m4b_path + ".chapters.m4b"
     result = subprocess.run(
         ["ffmpeg", "-y", "-loglevel", "error",
          "-i", m4b_path, "-i", metadata_path,
