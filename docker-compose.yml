@@ -17,6 +17,6 @@ services:
       # Audible auth + state database
       - /mnt/user/appdata/sync-audible:/config
       # Persistent library — on same share as ingest so hardlinks work
-      - /mnt/user/media/sync-audible/audiobooks:/audiobooks
+      - /mnt/user/media/audible:/audiobooks
       # Listenarr ingest directory (hardlinks land here)
       - /mnt/user/media/torrents/ingest/audiobooks:/media/ingest
